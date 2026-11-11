@@ -2,7 +2,8 @@
 -- Loaded from init.lua with require("tab_picker"). Press cmd+e again to close it.
 local home     = os.getenv("HOME")
 local dir      = home .. "/.config/rex/"
-local script   = dir .. "tab-picker.sh"
+local script   = dir .. "tab-picker.sh"          -- fzf fallback UI
+local uibin    = dir .. "bin/rex-tabs"           -- Rust UI (preferred when present)
 local dumper   = dir .. "tab-dump.lua"
 local state    = dir .. ".tab-picker.state"          -- layer id + result file of the open picker
 local mru      = dir .. "tab-mru.txt"                 -- optional, written by a tracker
@@ -26,16 +27,29 @@ local function layer_exists(view, id)
   return false
 end
 
+-- MRU file: one "window_id<TAB>unix_time" per line, most recent first
+local mru_ts = {}
 local function load_mru()
   local t = {}
+  mru_ts = {}
   local f = io.open(mru, "r")
-  if f then for line in f:lines() do line = trim(line); if line ~= "" then t[#t + 1] = line end end; f:close() end
+  if f then
+    for line in f:lines() do
+      local id, ts = line:match("^([^\t]+)\t?(%d*)")
+      id = trim(id or "")
+      if id ~= "" then t[#t + 1] = id; mru_ts[id] = tonumber(ts) end
+    end
+    f:close()
+  end
   return t
 end
 
-local function save_mru(t)
+local function save_mru(t, stamps)
   local f = io.open(mru, "w")
-  if f then f:write(table.concat(t, "\n"), "\n"); f:close() end
+  if f then
+    for _, id in ipairs(t) do f:write(id, "\t", tostring(stamps[id] or os.time()), "\n") end
+    f:close()
+  end
 end
 
 -- move id to the front of the most-recently-used list
@@ -43,7 +57,8 @@ local function touch_mru(id)
   local t, out = load_mru(), { id }
   for _, x in ipairs(t) do if x ~= id then out[#out + 1] = x end end
   while #out > 50 do out[#out] = nil end
-  save_mru(out)
+  mru_ts[id] = os.time()
+  save_mru(out, mru_ts)
 end
 
 -- Tabs of other sessions come from a cache kept fresh by tab-watcher.lua, so opening the
@@ -130,7 +145,8 @@ rex.action{
   title = "Switch Tab…",
   description = "Fuzzy tab switcher with live preview. Run again to close it.",
   keywords = "tab window switch recent picker",
-  run = function(ctx)
+  args = { dry = "boolean?" },
+  run = function(ctx, args)
     -- a second cmd+e while the first is still building the popup would open a second popup
     local lf = io.open(opening, "r")
     if lf then
@@ -267,6 +283,7 @@ rex.action{
       local custom = e.label and not e.label:match("^Window %x+$")
       local name = clean(custom and e.label or (title ~= "" and title or d ~= "" and d or "shell"))
       local is_cur = (e.id == curid)
+      e.dname = name; e.ddir = d
       local mark = is_cur and "\27[38;2;158;206;106m●\27[0m" or " "          -- green dot = current tab
       local num  = string.format("\27[38;2;86;95;137m%d\27[0m", e.n)           -- dim number
       local dirs = (d ~= "" and d ~= name) and ("  \27[38;2;86;95;137m" .. d .. "\27[0m") or ""
@@ -285,7 +302,26 @@ rex.action{
     end
 
     local list = os.tmpname()
-    local out = io.open(list, "w"); out:write(table.concat(lines, "\n"), "\n"); out:close()
+    local use_rust = false
+    do
+      local bf = io.open(uibin, "r")
+      if bf then bf:close(); use_rust = true end
+    end
+    if use_rust then
+      -- Rust UI: recency order, one flat table (JSON)
+      local rows = {}
+      local now = os.time()
+      for i, e in ipairs(ordered) do
+        local ts = mru_ts[e.id]
+        rows[#rows + 1] = { wid = e.id, sid = e.sid, n = e.n, session = e.slabel,
+                            name = e.dname or "shell", dir = e.ddir or "",
+                            current = (e.id == curid), ago = ts and (now - ts) or nil }
+        if e == pick then pickidx = i - 1 end     -- 0-based for the Rust UI
+      end
+      local out = io.open(list, "w"); out:write(rex.json.encode(rows)); out:close()
+    else
+      local out = io.open(list, "w"); out:write(table.concat(lines, "\n"), "\n"); out:close()
+    end
     -- Pre-select the previous tab right away, so a very quick Enter (before the popup has
     -- drawn) already goes to the right place. fzf only overwrites this after the user moves.
     local result = os.tmpname()
@@ -299,7 +335,23 @@ rex.action{
     end
     local h = math.max(0.1, math.min(0.85, (math.max(#lines, 14) + 6) / rows))
     local w = 0.6
+    if use_rust then
+      h = math.max(0.1, math.min(0.85, (math.max(#ordered, 8) + 7) / rows))
+      w = 0.7
+    end
     local y = 0.10   -- upper part of the window, like Telescope
+
+    local command
+    if use_rust then
+      command = { uibin, list, result, "--start", tostring(pickidx), "--title", curtitle }
+    else
+      command = { "/bin/bash", script, view.session_id or ctx.session_id, list, rexbin, curtitle, result, tostring(pickidx) }
+    end
+    if args and args.dry then          -- for tests: build everything, open nothing
+      os.remove(opening)
+      return { ui = use_rust and "rust" or "fzf", list = list, result = result, command = command,
+               bounds = { (1 - w) / 2, y, w, h } }
+    end
 
     local r = rex.session.new_layer{
       window_id = curid,
@@ -308,7 +360,7 @@ rex.action{
       layout = rex.layout.block{
         flavor = "com.superlogical.terminal.shell",
         options = {
-          command = { "/bin/bash", script, view.session_id or ctx.session_id, list, rexbin, curtitle, result, tostring(pickidx) },
+          command = command,
           shell = "none",
         },
       },

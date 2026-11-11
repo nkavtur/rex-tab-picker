@@ -103,17 +103,42 @@ impl App {
                 .collect();
         } else {
             let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+            let multi_word = self.query.trim().contains(char::is_whitespace);
             let mut buf = Vec::new();
             for (i, r) in self.rows.iter().enumerate() {
-                // search name, folder and session together; highlight only the name part
-                let hay = format!("{} {} {}", r.name, r.dir, r.session);
-                let mut idx = Vec::new();
-                if let Some(score) =
-                    pattern.indices(Utf32Str::new(&hay, &mut buf), &mut self.matcher, &mut idx)
-                {
-                    let name_len = r.name.chars().count() as u32;
-                    idx.retain(|&p| p < name_len);
-                    self.hits.push(Hit { row: i, hl: idx, score });
+                let mut best: Option<(u32, Vec<u32>)> = None;
+                if multi_word {
+                    // several words: each may match a different field, so search them joined
+                    let hay = format!("{} {} {}", r.name, r.dir, r.session);
+                    let mut idx = Vec::new();
+                    if let Some(sc) =
+                        pattern.indices(Utf32Str::new(&hay, &mut buf), &mut self.matcher, &mut idx)
+                    {
+                        let name_len = r.name.chars().count() as u32;
+                        idx.retain(|&p| p < name_len);
+                        best = Some((sc, idx));
+                    }
+                } else {
+                    // one word: it must match inside a single field (no letters scattered across
+                    // name, folder and session). The name counts a little more.
+                    for (field, bonus, is_name) in
+                        [(&r.name, 20u32, true), (&r.dir, 0, false), (&r.session, 0, false)]
+                    {
+                        let mut idx = Vec::new();
+                        if let Some(sc) = pattern.indices(
+                            Utf32Str::new(field, &mut buf),
+                            &mut self.matcher,
+                            &mut idx,
+                        ) {
+                            let sc = sc + bonus;
+                            if best.as_ref().map_or(true, |(b, _)| sc > *b) {
+                                best = Some((sc, if is_name { idx } else { vec![] }));
+                            }
+                        }
+                    }
+                }
+                if let Some((score, hl)) = best {
+                    self.hits.push(Hit { row: i, hl, score });
                 }
             }
             self.hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.row.cmp(&b.row)));
@@ -285,7 +310,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // columns
     let total = rows_area.width as usize;
-    let sess_w = app.rows.iter().map(|r| width(&r.session)).max().unwrap_or(0).min(16);
+    let sess_w = app.rows.iter().map(|r| width(&r.session)).max().unwrap_or(0).min(22);
     let dir_w = app.rows.iter().map(|r| width(&r.dir)).max().unwrap_or(0).min(18);
     let num_w = 3;
     let ago_w = 8;
@@ -293,7 +318,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let leader_w = if wide { 10 } else { 0 };
     let fixed = 3 /*marker*/ + sess_w + 1 + leader_w + (if leader_w > 0 { 1 } else { 0 })
         + dir_w + 1 + num_w + 1 + ago_w + 1;
-    let name_w = total.saturating_sub(fixed).max(8);
+    let name_w = total.saturating_sub(fixed + 1).max(8);
 
     for (line_no, hit) in app.hits.iter().enumerate().skip(app.scroll).take(visible) {
         let r = &app.rows[hit.row];
