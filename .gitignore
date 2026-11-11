@@ -1,0 +1,7 @@
+target/
+# runtime files written next to the plugin
+tabs-cache.json
+tab-mru.txt
+.tab-picker.*
+.tab-watcher.lock
+*.tmp
