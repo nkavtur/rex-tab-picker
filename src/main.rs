@@ -1,44 +1,44 @@
 //! rex-tabs: the terminal UI of the Rex `cmd+e` tab picker.
 //!
-//! It only draws, filters and moves the highlight. It never switches tabs itself: the
-//! highlighted tab is written to RESULT_FILE (three lines: tab number, session id, window id)
-//! after every change, and Rex key bindings (Enter / Esc / cmd+e in the `tabpick` mode) read it
-//! and do the switching. That is what lets the picker work without Remote Control.
+//! Like Axel's launcher, the popup is two Rex panes (a prompt on top, a list below), so Rex draws
+//! the rounded borders and title bars itself. This one program runs in both panes:
 //!
-//! usage: rex-tabs LIST_JSON RESULT_FILE [--start N] [--title TEXT]
+//!   rex-tabs prompt LIST_JSON RESULT_FILE STATE_FILE [--start N] [--title TEXT]
+//!   rex-tabs list   LIST_JSON STATE_FILE
+//!
+//! `prompt` has the keyboard focus: it filters, moves the highlight, writes the highlighted tab to
+//! RESULT_FILE (three lines: tab number, session id, window id) and its view of the world to
+//! STATE_FILE. `list` only draws STATE_FILE. Neither switches tabs: Rex key bindings (Enter / Esc /
+//! cmd+e in the `tabpick` mode) read RESULT_FILE and do that, which is why no Remote Control is
+//! needed.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use std::{env, fs, process};
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
-};
-use ratatui::crossterm::execute;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-// ---- palette (Tokyo Night-ish, close to Axel's launcher) -------------------------------------
-const ACCENT: Color = Color::Rgb(0xe0, 0x6c, 0x75); // prompt border
-const HEADING: Color = Color::Rgb(0xe0, 0xaf, 0x68); // "tabs" heading, matched letters
+// ---- palette (follows Axel's launcher: dark, warm headings, muted greys) -----------------------
+const ACCENT: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+const HEADING: Color = Color::Rgb(0xe0, 0xaf, 0x68);
 const TEXT: Color = Color::Rgb(0xc0, 0xca, 0xf5);
 const MUTED: Color = Color::Rgb(0x56, 0x5f, 0x89);
-const DIM_BORDER: Color = Color::Rgb(0x3b, 0x42, 0x61);
 const SELECTED_BG: Color = Color::Rgb(0x29, 0x2e, 0x42);
 const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
 const SESSION_COLORS: [Color; 5] = [
-    Color::Rgb(0xbb, 0x9a, 0xf7), // purple
-    Color::Rgb(0xe0, 0xaf, 0x68), // orange
-    Color::Rgb(0x7a, 0xa2, 0xf7), // blue
-    Color::Rgb(0x7d, 0xcf, 0xff), // cyan
-    Color::Rgb(0xf7, 0x76, 0x8e), // pink
+    Color::Rgb(0xbb, 0x9a, 0xf7),
+    Color::Rgb(0xe0, 0xaf, 0x68),
+    Color::Rgb(0x7a, 0xa2, 0xf7),
+    Color::Rgb(0x7d, 0xcf, 0xff),
+    Color::Rgb(0xf7, 0x76, 0x8e),
 ];
 
 #[derive(Deserialize, Clone)]
@@ -57,50 +57,49 @@ struct Row {
     ago: Option<i64>,
 }
 
-struct Hit {
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct HitS {
     row: usize,
-    /// char positions inside `name` that matched the query
+    /// char positions inside the tab name that matched the query
     hl: Vec<u32>,
-    score: u32,
 }
 
-struct App {
+#[derive(Serialize, Deserialize, Default)]
+struct State {
+    query: String,
+    /// position in `hits` of the highlighted tab
+    selected: usize,
+    hits: Vec<HitS>,
+}
+
+// ---- model -------------------------------------------------------------------------------------
+
+struct Model {
     rows: Vec<Row>,
     query: String,
-    hits: Vec<Hit>,
+    hits: Vec<(HitS, u32)>, // grouped by session; the u32 is the match score
     selected: usize,
-    scroll: usize,
-    result: PathBuf,
     matcher: Matcher,
-    list_area: Rect,
-    list_first_row_y: u16,
 }
 
-impl App {
-    fn new(rows: Vec<Row>, result: PathBuf, start: usize) -> Self {
-        let mut app = App {
+impl Model {
+    fn new(rows: Vec<Row>, start: usize) -> Self {
+        let mut m = Model {
             rows,
             query: String::new(),
             hits: Vec::new(),
             selected: 0,
-            scroll: 0,
-            result,
             matcher: Matcher::new(Config::DEFAULT),
-            list_area: Rect::default(),
-            list_first_row_y: 0,
         };
-        app.refilter();
-        app.selected = start.min(app.hits.len().saturating_sub(1));
-        app.write_result();
-        app
+        m.refilter();
+        m.selected = m.hits.iter().position(|(h, _)| h.row == start).unwrap_or(0);
+        m
     }
 
     fn refilter(&mut self) {
-        self.hits.clear();
+        let mut hits: Vec<(HitS, u32)> = Vec::new();
         if self.query.trim().is_empty() {
-            self.hits = (0..self.rows.len())
-                .map(|row| Hit { row, hl: vec![], score: 0 })
-                .collect();
+            hits = (0..self.rows.len()).map(|row| (HitS { row, hl: vec![] }, 0)).collect();
         } else {
             let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
             let multi_word = self.query.trim().contains(char::is_whitespace);
@@ -108,7 +107,7 @@ impl App {
             for (i, r) in self.rows.iter().enumerate() {
                 let mut best: Option<(u32, Vec<u32>)> = None;
                 if multi_word {
-                    // several words: each may match a different field, so search them joined
+                    // several words may match different fields: search them joined
                     let hay = format!("{} {} {}", r.name, r.dir, r.session);
                     let mut idx = Vec::new();
                     if let Some(sc) =
@@ -119,8 +118,7 @@ impl App {
                         best = Some((sc, idx));
                     }
                 } else {
-                    // one word: it must match inside a single field (no letters scattered across
-                    // name, folder and session). The name counts a little more.
+                    // one word: it must match inside a single field, not be scattered over all
                     for (field, bonus, is_name) in
                         [(&r.name, 20u32, true), (&r.dir, 0, false), (&r.session, 0, false)]
                     {
@@ -138,48 +136,76 @@ impl App {
                     }
                 }
                 if let Some((score, hl)) = best {
-                    self.hits.push(Hit { row: i, hl, score });
+                    hits.push((HitS { row: i, hl }, score));
                 }
             }
-            self.hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.row.cmp(&b.row)));
+            hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.row.cmp(&b.0.row)));
         }
-        self.selected = 0;
-        self.scroll = 0;
-    }
-
-    fn write_result(&self) {
-        let body = match self.hits.get(self.selected) {
-            Some(h) => {
-                let r = &self.rows[h.row];
-                format!("{}\n{}\n{}\n", r.n, r.sid, r.wid)
+        // group by session: sessions in order of their best hit, tabs inside keep their order
+        let mut order: Vec<&str> = Vec::new();
+        for (h, _) in &hits {
+            let sid = self.rows[h.row].sid.as_str();
+            if !order.contains(&sid) {
+                order.push(sid);
             }
-            None => String::new(), // nothing highlighted: Enter must do nothing
-        };
-        let tmp = self.result.with_extension("tmp");
-        if fs::write(&tmp, body).is_ok() {
-            let _ = fs::rename(&tmp, &self.result);
         }
+        let mut grouped = Vec::with_capacity(hits.len());
+        for sid in order {
+            for (h, sc) in &hits {
+                if self.rows[h.row].sid == sid {
+                    grouped.push((h.clone(), *sc));
+                }
+            }
+        }
+        self.hits = grouped;
+        self.selected = 0;
     }
 
     fn move_by(&mut self, delta: isize) {
         let n = self.hits.len();
-        if n == 0 {
-            return;
+        if n > 0 {
+            self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
         }
-        self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
-        self.write_result();
     }
 
     fn jump(&mut self, to: usize) {
-        if self.hits.is_empty() {
-            return;
+        if !self.hits.is_empty() {
+            self.selected = to.min(self.hits.len() - 1);
         }
-        self.selected = to.min(self.hits.len() - 1);
-        self.write_result();
+    }
+
+    fn state(&self) -> State {
+        State {
+            query: self.query.clone(),
+            selected: self.selected,
+            hits: self.hits.iter().map(|(h, _)| h.clone()).collect(),
+        }
     }
 }
 
-// ---- helpers ---------------------------------------------------------------------------------
+fn write_atomic(path: &Path, body: &str) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if fs::write(&tmp, body).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+/// the prompt's side effects: the highlighted tab for Rex, and the view for the list pane
+fn publish(m: &Model, result: &Path, state: &Path) {
+    let body = match m.hits.get(m.selected) {
+        Some((h, _)) => {
+            let r = &m.rows[h.row];
+            format!("{}\n{}\n{}\n", r.n, r.sid, r.wid)
+        }
+        None => String::new(), // nothing highlighted: Enter must do nothing
+    };
+    write_atomic(result, &body);
+    write_atomic(state, &serde_json::to_string(&m.state()).unwrap_or_default());
+}
+
+// ---- helpers -----------------------------------------------------------------------------------
 
 fn session_color(label: &str) -> Color {
     // FNV-1a, so a session keeps its colour between runs
@@ -217,187 +243,294 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn pad(s: &str, w: usize) -> String {
-    let n = width(s);
-    if n >= w {
-        s.to_string()
-    } else {
-        format!("{}{}", s, " ".repeat(w - n))
-    }
+fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) -> u16 {
+    let (nx, _) = buf.set_stringn(x, y, text, usize::MAX, style);
+    nx
 }
 
-// ---- drawing ---------------------------------------------------------------------------------
+fn set_title(title: &str) {
+    // Rex draws the pane's title bar from the terminal title
+    let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+    print!("\x1b]0;{clean}\x07");
+    let _ = io::stdout().flush();
+}
 
-fn draw(f: &mut Frame, app: &mut App) {
+// ---- prompt pane -------------------------------------------------------------------------------
+
+fn draw_prompt(f: &mut Frame, m: &Model) {
     let area = f.area();
-    let [prompt_area, list_area] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).areas(area);
-
-    // prompt panel
-    let prompt_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT));
-    let prompt_inner = prompt_block.inner(prompt_area);
-    f.render_widget(prompt_block, prompt_area);
-
-    let left = if app.query.is_empty() {
-        Line::from(vec![
-            Span::styled(" › ", Style::new().fg(MUTED)),
-            Span::styled("▏", Style::new().fg(TEXT)),
-            Span::styled("type to filter tabs", Style::new().fg(MUTED)),
-        ])
+    let buf = f.buffer_mut();
+    if area.width < 12 || area.height < 1 {
+        return;
+    }
+    // vertically centred, like Axel's prompt
+    let y = area.y + area.height.saturating_sub(1) / 2;
+    let left = area.x + 2;
+    let right = area.x + area.width - 2;
+    let mut x = put(buf, left, y, "› ", Style::new().fg(MUTED));
+    if m.query.is_empty() {
+        x = put(buf, x, y, "▏", Style::new().fg(TEXT));
+        put(buf, x, y, "type to filter tabs", Style::new().fg(MUTED));
     } else {
-        Line::from(vec![
-            Span::styled(" › ", Style::new().fg(MUTED)),
-            Span::styled(app.query.clone(), Style::new().fg(TEXT)),
-            Span::styled("▏", Style::new().fg(TEXT)),
-        ])
-    };
-    f.render_widget(Paragraph::new(left), prompt_inner);
-
-    if let Some(cur) = app.rows.iter().find(|r| r.current) {
-        let right = Line::from(vec![
-            Span::styled(cur.session.clone(), Style::new().fg(session_color(&cur.session))),
-            Span::styled(" · ", Style::new().fg(MUTED)),
-            Span::styled(truncate(&cur.name, 28), Style::new().fg(TEXT)),
-            Span::raw(" "),
-        ]);
-        f.render_widget(Paragraph::new(right).alignment(Alignment::Right), prompt_inner);
+        x = put(buf, x, y, &m.query, Style::new().fg(TEXT));
+        put(buf, x, y, "▏", Style::new().fg(TEXT));
     }
-
-    // list panel
-    let list_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(DIM_BORDER));
-    let inner = list_block.inner(list_area);
-    f.render_widget(list_block, list_area);
-    app.list_area = inner;
-    if inner.height < 2 || inner.width < 20 {
-        return;
-    }
-
-    // heading row: "tabs  recent ........ N"
-    let count = format!("{} ", app.hits.len());
-    let heading = Line::from(vec![
-        Span::styled(" tabs", Style::new().fg(HEADING).add_modifier(Modifier::BOLD)),
-        Span::styled("  recent", Style::new().fg(MUTED)),
-    ]);
-    f.render_widget(Paragraph::new(heading), Rect { height: 1, ..inner });
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(count, Style::new().fg(MUTED))))
-            .alignment(Alignment::Right),
-        Rect { height: 1, ..inner },
-    );
-
-    let rows_area = Rect { y: inner.y + 1, height: inner.height - 1, ..inner };
-    app.list_first_row_y = rows_area.y;
-    let visible = rows_area.height as usize;
-
-    // keep the selection on screen
-    if app.selected < app.scroll {
-        app.scroll = app.selected;
-    } else if app.selected >= app.scroll + visible {
-        app.scroll = app.selected + 1 - visible;
-    }
-
-    if app.hits.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(" no matching tabs", Style::new().fg(MUTED)))),
-            rows_area,
-        );
-        return;
-    }
-
-    // columns
-    let total = rows_area.width as usize;
-    let sess_w = app.rows.iter().map(|r| width(&r.session)).max().unwrap_or(0).min(22);
-    let dir_w = app.rows.iter().map(|r| width(&r.dir)).max().unwrap_or(0).min(18);
-    let num_w = 3;
-    let ago_w = 8;
-    let wide = total >= 78;
-    let leader_w = if wide { 10 } else { 0 };
-    let fixed = 3 /*marker*/ + sess_w + 1 + leader_w + (if leader_w > 0 { 1 } else { 0 })
-        + dir_w + 1 + num_w + 1 + ago_w + 1;
-    let name_w = total.saturating_sub(fixed + 1).max(8);
-
-    for (line_no, hit) in app.hits.iter().enumerate().skip(app.scroll).take(visible) {
-        let r = &app.rows[hit.row];
-        let selected = line_no == app.selected;
-        let bg = if selected { SELECTED_BG } else { Color::Reset };
-        let base = Style::new().bg(bg);
-
-        let mut spans: Vec<Span> = Vec::new();
-        spans.push(Span::styled(
-            if selected { "▎" } else { " " },
-            base.fg(ACCENT),
-        ));
-        spans.push(if r.current {
-            Span::styled("● ", base.fg(GREEN))
-        } else {
-            Span::styled("  ", base)
-        });
-
-        // name, with matched letters highlighted
-        let name = truncate(&r.name, name_w);
-        let hl: std::collections::HashSet<u32> = hit.hl.iter().copied().collect();
-        let name_style = base.fg(TEXT).add_modifier(Modifier::BOLD);
-        for (i, ch) in name.chars().enumerate() {
-            let st = if hl.contains(&(i as u32)) {
-                base.fg(HEADING).add_modifier(Modifier::BOLD)
-            } else {
-                name_style
-            };
-            spans.push(Span::styled(ch.to_string(), st));
-        }
-        spans.push(Span::styled(" ".repeat(name_w.saturating_sub(width(&name)) + 1), base));
-
-        spans.push(Span::styled(
-            pad(&truncate(&r.session, sess_w), sess_w),
-            base.fg(session_color(&r.session)),
-        ));
-        spans.push(Span::styled(" ", base));
-        if leader_w > 0 {
-            spans.push(Span::styled("·".repeat(leader_w), base.fg(DIM_BORDER)));
-            spans.push(Span::styled(" ", base));
-        }
-        spans.push(Span::styled(pad(&truncate(&r.dir, dir_w), dir_w), base.fg(MUTED)));
-        spans.push(Span::styled(" ", base));
-        spans.push(Span::styled(format!("{:>w$}", r.n, w = num_w), base.fg(MUTED)));
-        spans.push(Span::styled(" ", base));
-        spans.push(Span::styled(
-            format!("{:>w$}", ago_text(r.ago), w = ago_w),
-            base.fg(MUTED),
-        ));
-        spans.push(Span::styled(" ", base));
-
-        let y = rows_area.y + (line_no - app.scroll) as u16;
-        let area = Rect { x: rows_area.x, y, width: rows_area.width, height: 1 };
-        f.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
+    if let Some(cur) = m.rows.iter().find(|r| r.current) {
+        let name = truncate(&cur.name, 30);
+        let w = width(&cur.session) + 3 + width(&name);
+        let rx = right.saturating_sub(w as u16);
+        let mut x = put(buf, rx, y, &cur.session, Style::new().fg(session_color(&cur.session)));
+        x = put(buf, x, y, " · ", Style::new().fg(MUTED));
+        put(buf, x, y, &name, Style::new().fg(TEXT));
     }
 }
 
-// ---- main ------------------------------------------------------------------------------------
+fn run_prompt(rows: Vec<Row>, result: PathBuf, state: PathBuf, start: usize, title: String) {
+    let mut m = Model::new(rows, start);
+    publish(&m, &result, &state);
+    if !title.is_empty() {
+        set_title(&title); // keeps the tab's own name unchanged while the popup is open
+    }
+    let mut terminal = ratatui::init();
+    loop {
+        if terminal.draw(|f| draw_prompt(f, &m)).is_err() {
+            break;
+        }
+        let Ok(ev) = event::read() else { break };
+        let Event::Key(KeyEvent { code, modifiers, kind, .. }) = ev else { continue };
+        if kind == KeyEventKind::Release {
+            continue;
+        }
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let mut changed = true;
+        match (code, ctrl) {
+            // Enter / Esc are normally handled by Rex; if they reach us, just stop
+            (KeyCode::Esc, _) | (KeyCode::Enter, _) => break,
+            (KeyCode::Char('c'), true) | (KeyCode::Char('g'), true) => break,
+            (KeyCode::Down, _) | (KeyCode::Char('n'), true) | (KeyCode::Char('j'), true) => {
+                m.move_by(1)
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('p'), true) | (KeyCode::Char('k'), true) => {
+                m.move_by(-1)
+            }
+            (KeyCode::PageDown, _) => m.move_by(8),
+            (KeyCode::PageUp, _) => m.move_by(-8),
+            (KeyCode::Home, _) => m.jump(0),
+            (KeyCode::End, _) => m.jump(usize::MAX),
+            (KeyCode::Backspace, _) => {
+                m.query.pop();
+                m.refilter();
+            }
+            (KeyCode::Char('u'), true) => {
+                m.query.clear();
+                m.refilter();
+            }
+            (KeyCode::Char('w'), true) => {
+                let t = m.query.trim_end().len();
+                let cut = m.query[..t].rfind(' ').map(|i| i + 1).unwrap_or(0);
+                m.query.truncate(cut);
+                m.refilter();
+            }
+            (KeyCode::Char(c), false) => {
+                m.query.push(c);
+                m.refilter();
+            }
+            _ => changed = false,
+        }
+        if changed {
+            publish(&m, &result, &state);
+        }
+    }
+    ratatui::restore();
+}
+
+// ---- list pane ---------------------------------------------------------------------------------
+
+enum Item {
+    Header(usize), // index into hits of the group's first tab
+    Tab(usize),    // index into hits
+}
+
+fn draw_list(f: &mut Frame, rows: &[Row], st: &State, scroll: &mut usize) {
+    let area = f.area();
+    let buf = f.buffer_mut();
+    if area.width < 24 || area.height < 3 {
+        return;
+    }
+    let left = area.x + 2;
+    let right = area.x + area.width - 2; // exclusive
+    let w = (right - left) as usize;
+
+    // heading: "tabs  recent ........ N"
+    let hy = area.y + 1;
+    let hs = Style::new();
+    let x = put(buf, left, hy, "tabs", hs.fg(HEADING).add_modifier(Modifier::BOLD));
+    put(buf, x + 2, hy, "recent", hs.fg(MUTED));
+    let count = st.hits.len().to_string();
+    put(buf, right.saturating_sub(width(&count) as u16), hy, &count, hs.fg(MUTED));
+
+    // outline: a session header, then its tabs
+    let mut items: Vec<Item> = Vec::new();
+    let mut sel_item = 0usize;
+    let mut last: Option<&str> = None;
+    for (i, h) in st.hits.iter().enumerate() {
+        let Some(r) = rows.get(h.row) else { continue };
+        if last != Some(r.sid.as_str()) {
+            items.push(Item::Header(i));
+            last = Some(r.sid.as_str());
+        }
+        if i == st.selected {
+            sel_item = items.len();
+        }
+        items.push(Item::Tab(i));
+    }
+
+    let rows_y = hy + 2;
+    let visible = (area.y + area.height).saturating_sub(rows_y + 1) as usize;
+    if visible == 0 {
+        return;
+    }
+    if st.hits.is_empty() {
+        put(buf, left, rows_y, "no matching tabs", hs.fg(MUTED));
+        return;
+    }
+    if sel_item < *scroll {
+        *scroll = sel_item;
+        if *scroll > 0 && matches!(items[*scroll - 1], Item::Header(_)) {
+            *scroll -= 1; // keep a group's header visible with its first tab
+        }
+    } else if sel_item >= *scroll + visible {
+        *scroll = sel_item + 1 - visible;
+    }
+
+    let right_w = 8usize;
+    for (line, item) in items.iter().enumerate().skip(*scroll).take(visible) {
+        let y = rows_y + (line - *scroll) as u16;
+        match item {
+            Item::Header(hi) => {
+                let r = &rows[st.hits[*hi].row];
+                let n = st
+                    .hits
+                    .iter()
+                    .filter(|h| rows.get(h.row).map_or(false, |x| x.sid == r.sid))
+                    .count();
+                let label = format!("{} {}", n, if n == 1 { "tab" } else { "tabs" });
+                let name = truncate(&r.session, w.saturating_sub(label.len() + 4).max(8));
+                put(
+                    buf,
+                    left,
+                    y,
+                    &name,
+                    hs.fg(session_color(&r.session)).add_modifier(Modifier::BOLD),
+                );
+                put(buf, right.saturating_sub(width(&label) as u16), y, &label, hs.fg(MUTED));
+            }
+            Item::Tab(hi) => {
+                let hit = &st.hits[*hi];
+                let r = &rows[hit.row];
+                let selected = *hi == st.selected;
+                let base = if selected { Style::new().bg(SELECTED_BG) } else { Style::new() };
+                if selected {
+                    put(buf, left - 1, y, "▎", Style::new().fg(ACCENT).bg(SELECTED_BG));
+                    for xx in left..right + 1 {
+                        put(buf, xx, y, " ", base);
+                    }
+                }
+                let mut x = left + 1;
+                if r.current {
+                    put(buf, x, y, "●", base.fg(GREEN));
+                }
+                x += 3;
+                let right_start = right.saturating_sub(right_w as u16);
+                let avail = right_start.saturating_sub(x + 2) as usize;
+                let title = truncate(&r.name, avail);
+                let hl: HashSet<u32> = hit.hl.iter().copied().collect();
+                for (i, ch) in title.chars().enumerate() {
+                    let style = if hl.contains(&(i as u32)) {
+                        base.fg(HEADING).add_modifier(Modifier::BOLD)
+                    } else {
+                        base.fg(TEXT).add_modifier(Modifier::BOLD)
+                    };
+                    x = put(buf, x, y, &ch.to_string(), style);
+                }
+                if !r.dir.is_empty() && r.dir != r.name {
+                    let room = right_start.saturating_sub(x + 3) as usize;
+                    if room >= 6 {
+                        put(buf, x + 2, y, &truncate(&r.dir, room), base.fg(MUTED));
+                    }
+                }
+                let (text, col) = if r.current {
+                    ("Current".to_string(), GREEN)
+                } else {
+                    (ago_text(r.ago), MUTED)
+                };
+                put(buf, right_start, y, &format!("{:>w$}", text, w = right_w), base.fg(col));
+            }
+        }
+    }
+}
+
+fn mtime(p: &Path) -> Option<SystemTime> {
+    fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+fn run_list(rows: Vec<Row>, state_path: PathBuf) {
+    set_title("tabs");
+    let mut terminal = ratatui::init();
+    let mut st = State::default();
+    let mut seen: Option<SystemTime> = None;
+    let mut scroll = 0usize;
+    let mut dirty = true;
+    loop {
+        let t = mtime(&state_path);
+        if t != seen {
+            if let Some(s) = fs::read_to_string(&state_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<State>(&s).ok())
+            {
+                st = s;
+                seen = t;
+                dirty = true;
+            }
+        }
+        if dirty {
+            if terminal.draw(|f| draw_list(f, &rows, &st, &mut scroll)).is_err() {
+                break;
+            }
+            dirty = false;
+        }
+        // wait a little for a key / resize, then look at the state file again
+        match event::poll(Duration::from_millis(25)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Resize(..)) => dirty = true,
+                Ok(Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. }))
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    break
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+    ratatui::restore();
+}
+
+// ---- main --------------------------------------------------------------------------------------
 
 fn usage() -> ! {
-    eprintln!("usage: rex-tabs LIST_JSON RESULT_FILE [--start N] [--title TEXT]");
+    eprintln!("usage: rex-tabs prompt LIST RESULT STATE [--start N] [--title TEXT]");
+    eprintln!("       rex-tabs list   LIST STATE");
     process::exit(2);
 }
 
 fn main() {
     let mut args = env::args().skip(1);
+    let mode = args.next().unwrap_or_else(|| usage());
     let list = args.next().unwrap_or_else(|| usage());
-    let result = args.next().unwrap_or_else(|| usage());
-    let mut start = 0usize;
-    let mut title = String::new();
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--start" => start = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
-            "--title" => title = args.next().unwrap_or_default(),
-            _ => usage(),
-        }
-    }
-
-    let rows: Vec<Row> = match fs::read_to_string(Path::new(&list))
+    let rows: Vec<Row> = match fs::read_to_string(&list)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
     {
@@ -407,90 +540,25 @@ fn main() {
             process::exit(1);
         }
     };
-
-    let mut app = App::new(rows, PathBuf::from(&result), start);
-
-    // keep the tab's name unchanged while the popup is open (Rex names tabs after the title)
-    if !title.is_empty() {
-        let clean: String = title.chars().filter(|c| !c.is_control()).collect();
-        print!("\x1b]0;{clean}\x07");
-        let _ = io::stdout().flush();
-    }
-
-    let mut terminal = ratatui::init(); // raw mode, alternate screen, panic hook
-    let _ = execute!(io::stdout(), EnableMouseCapture);
-
-    loop {
-        if terminal.draw(|f| draw(f, &mut app)).is_err() {
-            break;
-        }
-        let ev = match event::read() {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-        match ev {
-            Event::Key(KeyEvent { code, modifiers, kind, .. }) if kind != KeyEventKind::Release => {
-                let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-                match (code, ctrl) {
-                    (KeyCode::Esc, _) | (KeyCode::Enter, _) => break, // normally handled by Rex
-                    (KeyCode::Char('c'), true) | (KeyCode::Char('g'), true) => break,
-                    (KeyCode::Down, _) | (KeyCode::Char('n'), true) | (KeyCode::Char('j'), true) => {
-                        app.move_by(1)
-                    }
-                    (KeyCode::Up, _) | (KeyCode::Char('p'), true) | (KeyCode::Char('k'), true) => {
-                        app.move_by(-1)
-                    }
-                    (KeyCode::PageDown, _) => app.move_by(8),
-                    (KeyCode::PageUp, _) => app.move_by(-8),
-                    (KeyCode::Home, _) => app.jump(0),
-                    (KeyCode::End, _) => app.jump(usize::MAX),
-                    (KeyCode::Backspace, _) => {
-                        app.query.pop();
-                        app.refilter();
-                        app.write_result();
-                    }
-                    (KeyCode::Char('u'), true) => {
-                        app.query.clear();
-                        app.refilter();
-                        app.write_result();
-                    }
-                    (KeyCode::Char('w'), true) => {
-                        let t = app.query.trim_end().len();
-                        let cut = app.query[..t].rfind(' ').map(|i| i + 1).unwrap_or(0);
-                        app.query.truncate(cut);
-                        app.refilter();
-                        app.write_result();
-                    }
-                    (KeyCode::Char(c), false) => {
-                        app.query.push(c);
-                        app.refilter();
-                        app.write_result();
-                    }
-                    _ => {}
+    match mode.as_str() {
+        "prompt" => {
+            let result = PathBuf::from(args.next().unwrap_or_else(|| usage()));
+            let state = PathBuf::from(args.next().unwrap_or_else(|| usage()));
+            let mut start = 0usize;
+            let mut title = String::new();
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--start" => start = args.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "--title" => title = args.next().unwrap_or_default(),
+                    _ => usage(),
                 }
             }
-            Event::Mouse(m) => match m.kind {
-                MouseEventKind::ScrollDown => app.move_by(1),
-                MouseEventKind::ScrollUp => app.move_by(-1),
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // a click only highlights; Rex's Enter binding does the switching
-                    let a = app.list_area;
-                    if m.row >= app.list_first_row_y
-                        && m.column >= a.x
-                        && m.column < a.x + a.width
-                    {
-                        let idx = app.scroll + (m.row - app.list_first_row_y) as usize;
-                        if idx < app.hits.len() {
-                            app.jump(idx);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
+            run_prompt(rows, result, state, start, title);
         }
+        "list" => {
+            let state = PathBuf::from(args.next().unwrap_or_else(|| usage()));
+            run_list(rows, state);
+        }
+        _ => usage(),
     }
-
-    let _ = execute!(io::stdout(), DisableMouseCapture);
-    ratatui::restore();
 }

@@ -93,12 +93,14 @@ local opening = dir .. ".tab-picker.opening"   -- re-entry guard while the popup
 local function read_state()
   local f = io.open(state, "r"); if not f then return nil end
   local layer = f:read("*l"); local result = f:read("*l"); local list = f:read("*l"); local sid = f:read("*l")
+  local uistate = f:read("*l")
   f:close()
-  if layer and result then return { layer = layer, result = result, list = list, sid = sid } end
+  if layer and result then return { layer = layer, result = result, list = list, sid = sid, uistate = uistate } end
 end
 
 local function drop_files(st)
   os.remove(st.result); os.remove(st.result .. ".tmp"); if st.list then os.remove(st.list) end
+  if st.uistate and st.uistate ~= "" then os.remove(st.uistate); os.remove(st.uistate .. ".tmp") end
   os.remove(state)
 end
 
@@ -335,39 +337,58 @@ rex.action{
     end
     local h = math.max(0.1, math.min(0.85, (math.max(#lines, 14) + 6) / rows))
     local w = 0.6
+    local top_ratio = 0.2
     if use_rust then
-      h = math.max(0.1, math.min(0.85, (math.max(#ordered, 8) + 7) / rows))
+      -- two Rex panes: a prompt (about 6 rows) and the list (rows + 6 rows of chrome/margins)
+      local nsess = 0
+      do
+        local seen_s = {}
+        for _, e in ipairs(ordered) do if not seen_s[e.sid] then seen_s[e.sid] = true; nsess = nsess + 1 end end
+      end
+      local items = #ordered + nsess
+      h = math.max(0.1, math.min(0.85, (math.max(items, 8) + 12) / rows))
       w = 0.7
+      top_ratio = math.max(0.12, math.min(0.4, 6 / math.max(h * rows, 1)))
     end
     local y = 0.10   -- upper part of the window, like Telescope
 
-    local command
+    local command, uistate
     if use_rust then
-      command = { uibin, list, result, "--start", tostring(pickidx), "--title", curtitle }
+      uistate = os.tmpname()
+      command = { uibin, "prompt", list, result, uistate, "--start", tostring(pickidx), "--title", curtitle }
     else
       command = { "/bin/bash", script, view.session_id or ctx.session_id, list, rexbin, curtitle, result, tostring(pickidx) }
     end
     if args and args.dry then          -- for tests: build everything, open nothing
       os.remove(opening)
       return { ui = use_rust and "rust" or "fzf", list = list, result = result, command = command,
-               bounds = { (1 - w) / 2, y, w, h } }
+               uistate = uistate, top_ratio = top_ratio, bounds = { (1 - w) / 2, y, w, h } }
+    end
+
+    local function term_block(cmd)
+      return rex.layout.block{
+        flavor = "com.superlogical.terminal.shell",
+        options = { command = cmd, shell = "none" },
+      }
+    end
+    local layout
+    if use_rust then
+      -- like Axel's launcher: a prompt pane over a list pane, so Rex draws the rounded borders
+      layout = rex.layout.vertical(top_ratio, term_block(command),
+                                   term_block({ uibin, "list", list, uistate }))
+    else
+      layout = term_block(command)
     end
 
     local r = rex.session.new_layer{
       window_id = curid,
       bounds = { (1 - w) / 2, y, w, h },
       focus = true,
-      layout = rex.layout.block{
-        flavor = "com.superlogical.terminal.shell",
-        options = {
-          command = command,
-          shell = "none",
-        },
-      },
+      layout = layout,
     }
-    if not r or not r.layer_id then os.remove(list); os.remove(result); os.remove(opening); return end
+    if not r or not r.layer_id then os.remove(list); os.remove(result); if uistate then os.remove(uistate) end; os.remove(opening); return end
 
-    local sf = io.open(state, "w"); sf:write(r.layer_id, "\n", result, "\n", list, "\n", view.session_id or ctx.session_id, "\n"); sf:close()
+    local sf = io.open(state, "w"); sf:write(r.layer_id, "\n", result, "\n", list, "\n", view.session_id or ctx.session_id, "\n", uistate or "", "\n"); sf:close()
     os.remove(opening)
     -- while the popup is open, Enter / Esc / cmd+e are handled by the tabpick key mode
     rex.client.queue("client.mode.enter", { name = "tabpick" })
