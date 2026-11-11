@@ -88,17 +88,45 @@ local function ensure_watcher()
   rex.exec.start({ rexbin, "do", "--all", watcher }, { detach = true })
 end
 
+local residents = dir .. ".tab-picker.resident"   -- session id -> resident popup block (kept running)
 local opening = dir .. ".tab-picker.opening"   -- re-entry guard while the popup is being built
+
+local function read_registry()
+  local t = {}
+  local f = io.open(residents, "r")
+  if f then
+    for line in f:lines() do
+      local sid, block, lst, res = line:match("^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)$")
+      if sid then t[sid] = { block = block, list = lst, result = res } end
+    end
+    f:close()
+  end
+  return t
+end
+
+local function write_registry(t)
+  local f = io.open(residents, "w")
+  if f then
+    for sid, r in pairs(t) do f:write(sid, "\t", r.block, "\t", r.list, "\t", r.result, "\n") end
+    f:close()
+  end
+end
 
 local function read_state()
   local f = io.open(state, "r"); if not f then return nil end
   local layer = f:read("*l"); local result = f:read("*l"); local list = f:read("*l"); local sid = f:read("*l")
-  local uistate = f:read("*l")
+  local uistate = f:read("*l"); local block = f:read("*l")
   f:close()
-  if layer and result then return { layer = layer, result = result, list = list, sid = sid, uistate = uistate } end
+  if layer and result then
+    return { layer = layer, result = result, list = list, sid = sid, uistate = uistate, block = block }
+  end
 end
 
 local function drop_files(st)
+  if st.block and st.block ~= "" then
+    os.remove(state)       -- the resident popup keeps its own list/result files
+    return
+  end
   os.remove(st.result); os.remove(st.result .. ".tmp"); if st.list then os.remove(st.list) end
   if st.uistate and st.uistate ~= "" then os.remove(st.uistate); os.remove(st.uistate .. ".tmp") end
   os.remove(state)
@@ -110,8 +138,9 @@ local function popup_alive(st)
   return v ~= nil and layer_exists(v, st.layer)
 end
 
--- closes the popup and cleans up; returns the pick { n = tab number, sid = session id,
--- wid = window id } (or nil)
+-- hides the popup and returns the pick { n = tab number, sid = session id, wid = window id }
+-- (or nil). A resident popup is only detached (its process keeps running, ready for the next
+-- cmd+e); the old fzf popup is closed.
 local function finish(pick)
   local st = read_state()
   if not st then return nil end
@@ -125,7 +154,12 @@ local function finish(pick)
       if n and trim(sid) ~= "" then sel = { n = n, sid = trim(sid), wid = trim(wid) } end
     end
   end
-  rex.session.close_layer{ session_id = st.sid, layer_id = st.layer }
+  if st.block and st.block ~= "" then
+    local ok = rex.session.detach_block{ session_id = st.sid, block_id = st.block }
+    if not ok then rex.session.close_layer{ session_id = st.sid, layer_id = st.layer } end
+  else
+    rex.session.close_layer{ session_id = st.sid, layer_id = st.layer }
+  end
   drop_files(st)
   return sel
 end
@@ -303,95 +337,173 @@ rex.action{
       if e == pick then pickidx = #lines end
     end
 
-    local list = os.tmpname()
     local use_rust = false
     do
       local bf = io.open(uibin, "r")
       if bf then bf:close(); use_rust = true end
     end
-    if use_rust then
-      -- Rust UI: recency order, one flat table (JSON)
-      local rows = {}
-      local now = os.time()
-      for i, e in ipairs(ordered) do
-        local ts = mru_ts[e.id]
-        rows[#rows + 1] = { wid = e.id, sid = e.sid, n = e.n, session = e.slabel,
-                            name = e.dname or "shell", dir = e.ddir or "",
-                            current = (e.id == curid), ago = ts and (now - ts) or nil }
-        if e == pick then pickidx = i - 1 end     -- 0-based for the Rust UI
-      end
-      local out = io.open(list, "w"); out:write(rex.json.encode(rows)); out:close()
-    else
-      local out = io.open(list, "w"); out:write(table.concat(lines, "\n"), "\n"); out:close()
-    end
-    -- Pre-select the previous tab right away, so a very quick Enter (before the popup has
-    -- drawn) already goes to the right place. fzf only overwrites this after the user moves.
-    local result = os.tmpname()
-    local rfile = io.open(result, "w"); if rfile then rfile:write(tostring(pick.n), "\n", pick.sid, "\n", pick.id, "\n"); rfile:close() end
 
-    -- size the popup to its content: borders, search box, footer + one row per tab
-    local rows = 40
+    -- the previous tab is preselected, so a very quick Enter already goes to the right place
+    local function result_text(p) return table.concat({ tostring(p.n), p.sid, p.id }, "\n") .. "\n" end
+
+    -- size the popup to its content
+    local rows, cols = 40, 160
     if cur and cur.block then
       local sz = rex.block.call(terminal, "size", { block_id = cur.block })
       rows = (sz and tonumber(sz.rows)) or rows
+      cols = (sz and tonumber(sz.columns)) or cols
     end
-    local h = math.max(0.1, math.min(0.85, (math.max(#lines, 14) + 6) / rows))
-    local w = 0.6
-    local top_ratio = 0.2
+    local nsess = 0
+    do
+      local seen_s = {}
+      for _, e in ipairs(ordered) do if not seen_s[e.sid] then seen_s[e.sid] = true; nsess = nsess + 1 end end
+    end
+    local y = 0.10   -- upper part of the window
+    local w, h
+
+    local function atomic_write(path, body)
+      local tmp = path .. ".tmp"
+      local f = io.open(tmp, "w")
+      if f then f:write(body); f:close(); os.rename(tmp, path) end
+    end
+
+    local sid_now = view.session_id or ctx.session_id
+
+    ------------------------------------------------------------------------------------------------
+    -- Rust UI: a resident popup. Its block keeps running while hidden (detached); showing it is
+    -- move_block + float_block, a few milliseconds, with no terminal to start.
+    ------------------------------------------------------------------------------------------------
     if use_rust then
-      -- two Rex panes: a prompt (about 6 rows) and the list (rows + 6 rows of chrome/margins)
-      local nsess = 0
-      do
-        local seen_s = {}
-        for _, e in ipairs(ordered) do if not seen_s[e.sid] then seen_s[e.sid] = true; nsess = nsess + 1 end end
-      end
       local items = #ordered + nsess
-      h = math.max(0.1, math.min(0.85, (math.max(items, 8) + 12) / rows))
-      w = 0.7
-      top_ratio = math.max(0.12, math.min(0.4, 6 / math.max(h * rows, 1)))
-    end
-    local y = 0.10   -- upper part of the window, like Telescope
+      -- width follows the longest name, not the window: inset 3 + dot 2 + inset 3 + frame
+      local longest = 0
+      for _, e in ipairs(ordered) do
+        longest = math.max(longest, #(e.dname or ""), #(e.slabel or ""))
+      end
+      w = math.max(0.2, math.min(0.6, math.max(46, math.min(72, longest + 12)) / cols))
+      -- rows: 1 pad + filter + separator + 1 blank + items + 1 pad, plus ~3 rows of Rex pane chrome
+      h = math.max(0.1, math.min(0.85, (math.max(items, 4) + 8) / rows))
+      local rowsj = {}
+      for i, e in ipairs(ordered) do
+        rowsj[#rowsj + 1] = { wid = e.id, sid = e.sid, n = e.n, session = e.slabel,
+                              name = e.dname or "shell", dir = e.ddir or "", current = (e.id == curid) }
+        if e == pick then pickidx = i - 1 end     -- 0-based for the Rust UI
+      end
+      local doc = rex.json.encode({ title = curtitle, start = pickidx, rows = rowsj })
 
-    local command, uistate
-    if use_rust then
-      uistate = os.tmpname()
-      command = { uibin, "prompt", list, result, uistate, "--start", tostring(pickidx), "--title", curtitle }
-    else
-      command = { "/bin/bash", script, view.session_id or ctx.session_id, list, rexbin, curtitle, result, tostring(pickidx) }
-    end
-    if args and args.dry then          -- for tests: build everything, open nothing
+      if args and args.dry then
+        os.remove(opening)
+        return { ui = "rust", doc = doc, bounds = { (1 - w) / 2, y, w, h } }
+      end
+
+      local reg = read_registry()
+      local res = reg[sid_now]
+      local created = false
+      if not res then
+        res = { block = "", list = os.tmpname(), result = os.tmpname() }
+      end
+      atomic_write(res.list, doc)                       -- fresh data before the popup appears
+      atomic_write(res.result, result_text(pick))
+      if res.block == "" then
+        local nb = rex.session.new_block{ session_id = sid_now, flavor = "com.superlogical.terminal.shell",
+          options = { command = { uibin, "resident", res.list, res.result }, shell = "none" } }
+        if not nb then os.remove(opening); return end
+        res.block = nb.block_id; reg[sid_now] = res; write_registry(reg); created = true
+      end
+
+      local anchor = ctx.block_id or (cur and cur.block)
+      local function place()
+        return rex.session.move_block{ session_id = sid_now, block_id = res.block, anchor_block_id = anchor,
+                                       direction = "vertical", ratio = 0.995, position = "after" }
+      end
+      local mv = place()
+      if not mv and not created then
+        -- the resident process is gone (exited, or Rex restarted): start a new one
+        local nb = rex.session.new_block{ session_id = sid_now, flavor = "com.superlogical.terminal.shell",
+          options = { command = { uibin, "resident", res.list, res.result }, shell = "none" } }
+        if not nb then os.remove(opening); return end
+        res.block = nb.block_id; reg[sid_now] = res; write_registry(reg)
+        mv = place()
+      end
+      if not mv then os.remove(opening); return end
+      local fl = rex.session.float_block{ session_id = sid_now, block_id = res.block,
+                                          bounds = { (1 - w) / 2, y, w, h } }
+      if not fl or not fl.layer_id then
+        rex.session.detach_block{ session_id = sid_now, block_id = res.block }
+        os.remove(opening); return
+      end
+      rex.session.focus_block{ session_id = sid_now, block_id = res.block }
+
+      local sf = io.open(state, "w")
+      sf:write(fl.layer_id, "\n", res.result, "\n", res.list, "\n", sid_now, "\n", "", "\n", res.block, "\n")
+      sf:close()
       os.remove(opening)
-      return { ui = use_rust and "rust" or "fzf", list = list, result = result, command = command,
-               uistate = uistate, top_ratio = top_ratio, bounds = { (1 - w) / 2, y, w, h } }
+      rex.client.queue("client.mode.enter", { name = "tabpick" })
+      return
     end
 
-    local function term_block(cmd)
-      return rex.layout.block{
-        flavor = "com.superlogical.terminal.shell",
-        options = { command = cmd, shell = "none" },
-      }
+    ------------------------------------------------------------------------------------------------
+    -- fzf fallback (no Rust binary installed): a fresh popup every time
+    ------------------------------------------------------------------------------------------------
+    local list = os.tmpname()
+    local out = io.open(list, "w"); out:write(table.concat(lines, "\n"), "\n"); out:close()
+    local result = os.tmpname()
+    atomic_write(result, result_text(pick))
+    h = math.max(0.1, math.min(0.85, (math.max(#lines, 14) + 6) / rows))
+    w = 0.6
+    local command = { "/bin/bash", script, sid_now, list, rexbin, curtitle, result, tostring(pickidx) }
+    if args and args.dry then
+      os.remove(opening)
+      return { ui = "fzf", list = list, result = result, command = command, bounds = { (1 - w) / 2, y, w, h } }
     end
-    local layout
-    if use_rust then
-      -- like Axel's launcher: a prompt pane over a list pane, so Rex draws the rounded borders
-      layout = rex.layout.vertical(top_ratio, term_block(command),
-                                   term_block({ uibin, "list", list, uistate }))
-    else
-      layout = term_block(command)
-    end
-
     local r = rex.session.new_layer{
       window_id = curid,
       bounds = { (1 - w) / 2, y, w, h },
       focus = true,
-      layout = layout,
+      layout = rex.layout.block{
+        flavor = "com.superlogical.terminal.shell",
+        options = { command = command, shell = "none" },
+      },
     }
-    if not r or not r.layer_id then os.remove(list); os.remove(result); if uistate then os.remove(uistate) end; os.remove(opening); return end
-
-    local sf = io.open(state, "w"); sf:write(r.layer_id, "\n", result, "\n", list, "\n", view.session_id or ctx.session_id, "\n", uistate or "", "\n"); sf:close()
+    if not r or not r.layer_id then os.remove(list); os.remove(result); os.remove(opening); return end
+    local sf = io.open(state, "w")
+    sf:write(r.layer_id, "\n", result, "\n", list, "\n", sid_now, "\n", "", "\n", "", "\n")
+    sf:close()
     os.remove(opening)
-    -- while the popup is open, Enter / Esc / cmd+e are handled by the tabpick key mode
     rex.client.queue("client.mode.enter", { name = "tabpick" })
+  end,
+}
+
+-- Pre-start the resident popup of the current session without showing it, so even the first
+-- cmd+e there is instant.
+rex.action{
+  name  = "tab_picker_warm",
+  title = "Tab Picker: Warm Up",
+  run = function(ctx)
+    local bf = io.open(uibin, "r")
+    if not bf then return end
+    bf:close()
+    local sid = ctx.session_id
+    local reg = read_registry()
+    if reg[sid] and reg[sid].block ~= "" then return end
+    local res = { block = "", list = os.tmpname(), result = os.tmpname() }
+    local f = io.open(res.list, "w"); if f then f:write('{"rows":[]}'); f:close() end
+    local nb = rex.session.new_block{ session_id = sid, flavor = "com.superlogical.terminal.shell",
+      options = { command = { uibin, "resident", res.list, res.result }, shell = "none" } }
+    if nb then res.block = nb.block_id; reg[sid] = res; write_registry(reg) end
+  end,
+}
+
+-- Recovery: stop every resident popup process (the next cmd+e starts a fresh one).
+rex.action{
+  name  = "tab_picker_reset",
+  title = "Tab Picker: Reset",
+  run = function(ctx)
+    local reg = read_registry()
+    for sid, r in pairs(reg) do
+      rex.call("block.close", { session_id = sid, block_id = r.block })
+    end
+    os.remove(residents)
   end,
 }
 
