@@ -232,6 +232,7 @@ fn set_title(title: &str) {
 enum Item {
     Header(usize), // index into hits of the group's first tab
     Tab(usize),    // index into hits
+    Gap,           // one blank row between two sessions
 }
 
 fn draw(f: &mut Frame, m: &mut Model) {
@@ -281,6 +282,9 @@ fn draw(f: &mut Frame, m: &mut Model) {
     for (i, (h, _)) in m.hits.iter().enumerate() {
         let Some(r) = m.rows.get(h.row) else { continue };
         if last != Some(r.sid.as_str()) {
+            if !items.is_empty() {
+                items.push(Item::Gap);
+            }
             items.push(Item::Header(i));
             last = Some(r.sid.as_str());
         }
@@ -304,6 +308,9 @@ fn draw(f: &mut Frame, m: &mut Model) {
         if m.scroll > 0 && matches!(items[m.scroll - 1], Item::Header(_)) {
             m.scroll -= 1; // keep a group's header visible with its first tab
         }
+        if m.scroll > 0 && matches!(items[m.scroll], Item::Header(_)) && matches!(items[m.scroll - 1], Item::Gap) {
+            m.scroll -= 1; // and the blank row above it, if it fits
+        }
     } else if sel_item >= m.scroll + visible {
         m.scroll = sel_item + 1 - visible;
     }
@@ -311,6 +318,7 @@ fn draw(f: &mut Frame, m: &mut Model) {
     for (line, item) in items.iter().enumerate().skip(m.scroll).take(visible) {
         let y = rows_y + (line - m.scroll) as u16;
         match item {
+            Item::Gap => {}
             Item::Header(hi) => {
                 let r = &m.rows[m.hits[*hi].0.row];
                 let name = truncate(&r.session, (right - left) as usize);

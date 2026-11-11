@@ -382,7 +382,8 @@ rex.action{
       end
       w = math.max(0.2, math.min(0.6, math.max(46, math.min(72, longest + 12)) / cols))
       -- rows: 1 pad + filter + separator + 1 blank + items + 1 pad, plus ~3 rows of Rex pane chrome
-      h = math.max(0.1, math.min(0.85, (math.max(items, 4) + 8) / rows))
+      -- (one blank row between sessions; the bottom gap is one row shorter than before)
+      h = math.max(0.1, math.min(0.85, (math.max(items + nsess - 1, 4) + 7) / rows))
       local rowsj = {}
       for i, e in ipairs(ordered) do
         rowsj[#rowsj + 1] = { wid = e.id, sid = e.sid, n = e.n, session = e.slabel,
