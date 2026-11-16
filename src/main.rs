@@ -34,6 +34,20 @@ const SEPARATOR: Color = Color::Rgb(0x2f, 0x34, 0x4d);
 const SELECTED_BG: Color = Color::Rgb(0x28, 0x2d, 0x45);
 const MATCH: Color = Color::Rgb(0xe0, 0xaf, 0x68);
 const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
+const BLUE: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
+const ORANGE: Color = Color::Rgb(0xff, 0x9e, 0x64);
+const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
+
+/// Colour of a tab's agent status label.
+fn status_color(status: &str) -> Color {
+    match status {
+        "working" => BLUE,
+        "blocked" => ORANGE,
+        "done" => GREEN,
+        "error" => RED,
+        _ => MUTED,
+    }
+}
 
 #[derive(Deserialize, Clone)]
 struct Row {
@@ -46,6 +60,11 @@ struct Row {
     dir: String,
     #[serde(default)]
     current: bool,
+    /// What a program in the tab reports (OSC 7501): working, blocked, done or error.
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    status_text: String,
 }
 
 #[derive(Deserialize)]
@@ -338,7 +357,18 @@ fn draw(f: &mut Frame, m: &mut Model) {
                 if r.current {
                     put(buf, left, y, "●", base.fg(GREEN));
                 }
-                let title = truncate(&r.name, right.saturating_sub(x) as usize);
+                // agent status, right-aligned; the name gives way to it
+                let mut name_right = right;
+                if !r.status.is_empty() {
+                    let text = if r.status_text.is_empty() { &r.status } else { &r.status_text };
+                    let label = format!("● {text}");
+                    let lw = width(&label) as u16;
+                    if right.saturating_sub(x) > lw + 8 {
+                        put(buf, right - lw, y, &label, base.fg(status_color(&r.status)));
+                        name_right = right - lw - 2;
+                    }
+                }
+                let title = truncate(&r.name, name_right.saturating_sub(x) as usize);
                 let hl: HashSet<u32> = hit.hl.iter().copied().collect();
                 for (i, ch) in title.chars().enumerate() {
                     let style = if hl.contains(&(i as u32)) {

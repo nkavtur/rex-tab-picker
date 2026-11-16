@@ -14,6 +14,27 @@ do  -- if Rex lives somewhere else, fall back to `rex` on PATH
   if f then f:close() else rexbin = "rex" end
 end
 
+-- What the programs in a tab report over OSC 7501 (Claude Code does): the most urgent state
+-- of any block in the window. Returns state ("blocked" | "error" | "working" | "done") and a
+-- short label, or nothing when everything is idle.
+local urgency = { blocked = 4, error = 3, working = 2, done = 1 }
+local blocked_text = { permission = "permission", question = "question", auth = "auth" }
+local function window_status(w, sid)
+  local best, bestrank, kind = nil, 0, nil
+  for _, l in ipairs(w.layers or {}) do
+    for _, b in ipairs(l.blocks or {}) do
+      local r = rex.block.call(terminal, "program_status", { block_id = b.block_id, session_id = sid })
+      for _, rec in ipairs(r and r.records or {}) do
+        local rk = urgency[rec.state] or 0
+        if rk > bestrank then best, bestrank, kind = rec.state, rk, rec.kind end
+      end
+    end
+  end
+  if not best then return nil end
+  local text = best == "blocked" and (blocked_text[kind or ""] or "waiting") or best
+  return best, text
+end
+
 local function trim(s) return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
 local function clean(s) return (tostring(s or ""):gsub("%c", " ")) end   -- no tabs/newlines/escapes in rows
 local function base(p) return p and (p:match("([^/]+)/*$") or p) or "" end
@@ -241,6 +262,7 @@ rex.action{
         for i, w in ipairs(view.windows or {}) do
           local e = { id = w.window_id, block = w.focused_block_id, n = i, label = w.label,
                       sid = sess.session_id, slabel = clean(sess.label) }
+          e.status, e.status_text = window_status(w, nil)
           if not e.block then
             local b = w.layers and w.layers[1] and w.layers[1].blocks and w.layers[1].blocks[1]
             e.block = b and b.block_id
@@ -251,6 +273,7 @@ rex.action{
         for _, r in ipairs(cached[sess.session_id].rows or {}) do
           local e = { id = r.id, block = r.block, n = r.n or 0, label = r.label,
                       title = clean(trim(r.title)), pwd = clean(r.pwd),
+                      status = r.status, status_text = r.status_text,
                       sid = sess.session_id, slabel = clean(sess.label) }
           wins[#wins + 1] = e; byid[e.id] = e
         end
@@ -323,7 +346,12 @@ rex.action{
       local mark = is_cur and "\27[38;2;158;206;106m●\27[0m" or " "          -- green dot = current tab
       local num  = string.format("\27[38;2;86;95;137m%d\27[0m", e.n)           -- dim number
       local dirs = (d ~= "" and d ~= name) and ("  \27[38;2;86;95;137m" .. d .. "\27[0m") or ""
-      local shown = string.format("  %s  %s  \27[1m%s\27[0m%s", mark, num, name, dirs)
+      local tag = ""
+      if e.status then
+        local color = ({ working = "122;162;247", blocked = "255;158;100", done = "158;206;106", error = "247;118;142" })[e.status] or "86;95;137"
+        tag = string.format("  \27[38;2;%sm● %s\27[0m", color, e.status_text or e.status)
+      end
+      local shown = string.format("  %s  %s  \27[1m%s\27[0m%s%s", mark, num, name, dirs, tag)
       if multi then
         shown = "  " .. shown
         if e.first then
@@ -387,7 +415,8 @@ rex.action{
       local rowsj = {}
       for i, e in ipairs(ordered) do
         rowsj[#rowsj + 1] = { wid = e.id, sid = e.sid, n = e.n, session = e.slabel,
-                              name = e.dname or "shell", dir = e.ddir or "", current = (e.id == curid) }
+                              name = e.dname or "shell", dir = e.ddir or "", current = (e.id == curid),
+                              status = e.status, status_text = e.status_text }
         if e == pick then pickidx = i - 1 end     -- 0-based for the Rust UI
       end
       local doc = rex.json.encode({ title = curtitle, start = pickidx, rows = rowsj })

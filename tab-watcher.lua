@@ -15,6 +15,27 @@ do
 end
 local attached = {}
 
+-- What the programs in a tab report over OSC 7501 (Claude Code does): the most urgent state
+-- of any block in the window. Returns state ("blocked" | "error" | "working" | "done") and a
+-- short label, or nothing when everything is idle.
+local urgency = { blocked = 4, error = 3, working = 2, done = 1 }
+local blocked_text = { permission = "permission", question = "question", auth = "auth" }
+local function window_status(w, sid)
+  local best, bestrank, kind = nil, 0, nil
+  for _, l in ipairs(w.layers or {}) do
+    for _, b in ipairs(l.blocks or {}) do
+      local r = rex.block.call(terminal, "program_status", { block_id = b.block_id, session_id = sid })
+      for _, rec in ipairs(r and r.records or {}) do
+        local rk = urgency[rec.state] or 0
+        if rk > bestrank then best, bestrank, kind = rec.state, rk, rec.kind end
+      end
+    end
+  end
+  if not best then return nil end
+  local text = best == "blocked" and (blocked_text[kind or ""] or "waiting") or best
+  return best, text
+end
+
 local function attach(sid)
   if not attached[sid] then
     local _, err = rex.session.attach{ session_id = sid }
@@ -51,8 +72,9 @@ local function snapshot()
           title = t and t.title or ""
           pwd   = p and p.pwd or ""
         end
+        local status, status_text = window_status(w, s.session_id)
         rows[#rows + 1] = { id = w.window_id, block = block, n = i, label = w.label,
-                            title = title, pwd = pwd }
+                            title = title, pwd = pwd, status = status, status_text = status_text }
       end
     end
     out.sessions[#out.sessions + 1] = { id = s.session_id, label = s.label, rows = rows }
@@ -74,7 +96,8 @@ end
 
 for _, ev in ipairs({ "session_view_changed", "window_created", "window_closed", "window_label_changed",
                       "session_created", "session_destroyed", "session_label_changed",
-                      "terminal.title_changed", "terminal.pwd_changed" }) do
+                      "terminal.title_changed", "terminal.pwd_changed",
+                      "terminal.program_status_changed", "terminal.program_status_removed" }) do
   rex.on(ev, function() schedule() end)
 end
 
