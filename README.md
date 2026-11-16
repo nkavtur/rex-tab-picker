@@ -11,17 +11,24 @@ A `cmd+e` tab switcher for [Rex](https://www.superlogical.com/rex). Fuzzy-find a
 
 ## Install
 
-Needs Rex on macOS and a Rust toolchain (an `fzf` popup is used as a fallback if the binary is missing).
+Needs Rex on macOS (Apple silicon or Intel). Releases ship prebuilt binaries, so no Rust is needed
+(an `fzf` popup is used as a fallback if the binary is missing). The repo is private: run `gh auth login` first.
 
 ```sh
-git clone https://github.com/nkavtur/rex-tab-picker && cd rex-tab-picker
-cargo build --release
 mkdir -p ~/.config/rex/bin
-cp target/release/rex-tabs ~/.config/rex/bin/
-cp tab_picker.lua tab-picker.sh tab-dump.lua tab-watcher.lua ~/.config/rex/
+case "$(uname -m)" in arm64) T=aarch64-apple-darwin ;; *) T=x86_64-apple-darwin ;; esac
+gh release download --repo nkavtur/rex-tab-picker --pattern "rex-tabs-$T" --output ~/.config/rex/bin/rex-tabs --clobber
+chmod +x ~/.config/rex/bin/rex-tabs
+gh repo clone nkavtur/rex-tab-picker /tmp/rex-tab-picker -- --depth 1
+cp /tmp/rex-tab-picker/{tab_picker.lua,tab-picker.sh,tab-dump.lua,tab-watcher.lua} ~/.config/rex/
 echo 'require("tab_picker")' >> ~/.config/rex/init.lua
 rex config check && rex config reload
 ```
+
+Building from source instead: `cargo build --release`, then copy `target/release/rex-tabs` to `~/.config/rex/bin/`.
+
+`rex-tabs --version` prints the installed version. To publish a release, bump `version` in `Cargo.toml`,
+then push a tag: `git tag v0.2.0 && git push origin v0.2.0`. GitHub Actions builds both architectures.
 
 ## How it works
 

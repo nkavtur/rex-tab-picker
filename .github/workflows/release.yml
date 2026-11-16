@@ -1,0 +1,27 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest   # Apple silicon; the Intel binary is cross-compiled
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        run: |
+          v="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml version v$v"; exit 1; }
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build both architectures
+        run: |
+          mkdir dist
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$t"
+            cp "target/$t/release/rex-tabs" "dist/rex-tabs-$t"
+          done
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

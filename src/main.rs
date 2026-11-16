@@ -494,8 +494,13 @@ fn usage() -> ! {
 
 fn main() {
     let mut args = env::args().skip(1);
-    if args.next().as_deref() != Some("resident") {
-        usage();
+    match args.next().as_deref() {
+        Some("resident") => {}
+        Some("--version") | Some("-V") => {
+            println!("rex-tabs {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        _ => usage(),
     }
     let list = PathBuf::from(args.next().unwrap_or_else(|| usage()));
     let result = PathBuf::from(args.next().unwrap_or_else(|| usage()));
