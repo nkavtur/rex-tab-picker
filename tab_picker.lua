@@ -546,18 +546,10 @@ rex.action{
     if sel then touch_mru(sel.wid) end
     rex.client.queue("client.mode.exit_all")
     if not sel then return end
-    if sel.sid ~= ctx.session_id then
-      -- Another session: session.select takes the window too, so one client action does the
-      -- whole switch. (No tab.goto, which would run against the old session first, and no
-      -- extra rex process, which cost ~100 ms.)
-      rex.client.queue("session.select", { session_id = sel.sid, window_id = sel.wid })
-    else
-      -- Same session: look the position up again, tabs may have closed since the popup opened.
-      local v = rex.session.view{}
-      local idx
-      for i, w in ipairs(v and v.windows or {}) do if w.window_id == sel.wid then idx = i end end
-      if idx then rex.client.queue("client.tab.goto", { index = idx }) end
-    end
+    -- session.select takes the window too, so one client action does the whole switch, in the
+    -- same session as well. (client.tab.goto is no good here: its index is not per session, so
+    -- "tab 1" of the current session could land on the first tab of another one.)
+    rex.client.queue("session.select", { session_id = sel.sid, window_id = sel.wid })
   end,
 }
 
